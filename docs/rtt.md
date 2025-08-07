@@ -56,8 +56,8 @@ RTT values vary widely depending on network conditions:
 
 The `sctp_rtt.py` tool uses eBPF to hook into the kernel's SCTP implementation and track RTT measurements in real-time:
 
-1. Traces the [sctp_transmit_packet()](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/output.c#L569) function to capture packet send times
-2. Traces the [sctp_sf_eat_sack()](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/sm_statefuns.c#L3392) function to capture acknowledgment times
+1. Traces the [sctp_transmit_packet](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/output.c#L569) function to capture packet send times
+2. Traces the [sctp_sf_eat_sack_6_2](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/sm_statefuns.c#L3392) function to capture acknowledgment times
 3. Calculates the difference to determine RTT
 4. Provides statistics including average, minimum, and maximum RTT values
 

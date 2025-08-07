@@ -60,7 +60,7 @@ The divisor (16) provides smoothing, making the estimate less sensitive to outli
 
 The `sctp_jitter.py` tool uses eBPF to monitor packet timing in the kernel:
 
-1. Traces the [sctp_eat_data()](https://elixir.bootlin.com/linux/v6.16/source/net/sctp/sm_statefuns.c#L6486) function to track chunk transmission timing
+1. Traces the [sctp_eat_data](https://elixir.bootlin.com/linux/v6.16/source/net/sctp/sm_statefuns.c#L6486) function to track chunk transmission timing
 2. Calculates inter-arrival times between consecutive packets
 3. Computes jitter using the formula described above
 4. Provides per-stream jitter statistics

@@ -17,12 +17,17 @@ import argparse
 import signal
 import math
 from collections import defaultdict
+import csv
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
     description="Analyze SCTP stream utilisation")
 parser.add_argument("-i", "--interval", type=int, default=5,
     help="summary interval, in seconds")
+parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+parser.add_argument(
+    "-f", "--file", metavar="FILE", help="Write output to a specified file"
+)
 args = parser.parse_args()
 
 # Define BPF program
@@ -159,6 +164,13 @@ associations = {}  # (assoc_id) -> {stream_id -> StreamStats}
 
 print("Tracing SCTP stream utilisation... Hit Ctrl-C to end")
 
+# Setup CSV file and writer if requested
+csvfile = None
+writer = None
+if args.file:
+    csvfile = open(args.file, "w", newline="")
+    writer = csv.writer(csvfile)
+
 # Process stream events
 def process_stream_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(StreamEvent)).contents
@@ -196,9 +208,7 @@ def calculate_sui(stream_bytes):
 
 # Print utilisation summary
 def print_summary():
-    print("\n=== Stream utilisation Summary ===")
     for (assoc_id), streams in sorted(associations.items()):
-        print(f"\nAssociation {assoc_id}:")
         
         # Collect stream statistics
         total_bytes = 0
@@ -207,7 +217,8 @@ def print_summary():
         ordered_vs_unordered = [0, 0]  # [ordered, unordered]
         
         for stream_id, stats in sorted(streams.items()):
-            print(f"  Stream {stream_id}: {stats.bytes_sent} bytes, {stats.chunks_sent} chunks "
+            if not (args.csv or args.file):
+                print(f"  Stream {stream_id}: {stats.bytes_sent} bytes, {stats.chunks_sent} chunks "
                   f"({stats.ordered_chunks} ordered, {stats.unordered_chunks} unordered)")
             
             total_bytes += stats.bytes_sent
@@ -222,12 +233,31 @@ def print_summary():
         # Calculate stream parallelism
         active_streams = len([b for b in stream_bytes.values() if b > 0])
         stream_parallelism = active_streams / len(streams) if streams else 0
-        
-        print(f"  Total streams: {len(streams)}, Active streams: {active_streams}")
-        print(f"  Total data: {total_bytes} bytes, {total_chunks} chunks")
-        print(f"  Ordered vs Unordered ratio: {ordered_vs_unordered[0]}:{ordered_vs_unordered[1]}")
-        print(f"  Stream utilisation Index: {sui:.3f} (0=imbalanced, 1=balanced)")
-        print(f"  Stream Parallelism: {stream_parallelism:.3f}")
+
+        if args.csv or args.file:
+            row = [
+                assoc_id, 
+                len(streams),
+                active_streams,
+                total_bytes,
+                total_chunks,
+                ordered_vs_unordered[0],
+                ordered_vs_unordered[1],
+                f"{sui:.3f}",
+                f"{stream_parallelism:.3f}"
+            ]
+            if args.file:
+                writer.writerow(row)
+            else:
+                print(",".join(map(str, row)))
+        else:
+            print("\n=== Stream utilisation Summary ===")
+            print(f"\nAssociation {assoc_id}:")
+            print(f"  Total streams: {len(streams)}, Active streams: {active_streams}")
+            print(f"  Total data: {total_bytes} bytes, {total_chunks} chunks")
+            print(f"  Ordered vs Unordered ratio: {ordered_vs_unordered[0]}:{ordered_vs_unordered[1]}")
+            print(f"  Stream utilisation Index: {sui:.3f} (0=imbalanced, 1=balanced)")
+            print(f"  Stream Parallelism: {stream_parallelism:.3f}")
 
 # Cleanup on keyboard interrupt
 def signal_handler(signal, frame):
@@ -235,6 +265,15 @@ def signal_handler(signal, frame):
     exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+
+if args.csv:
+    # CSV to stdout, header already printed
+    print("Tracing SCTP RTT to stdout in CSV format... Ctrl+C to end")
+    print("assoc_id,total_streams,active_streams,total_bytes,total_chunks,ordered,unordered,sui,stream_parallelism")
+else:
+    # Write CSV header to file
+    print(f"Tracing SCTP RTT to file '{args.file}'... Ctrl+C to end")
+    writer.writerow(["assoc_id", "total_streams", "active_streams", "total_bytes", "total_chunks", "ordered", "unordered", "sui", "stream_parallelism"])
 
 # Main loop with periodic summaries
 while True:
@@ -244,4 +283,7 @@ while True:
         b.perf_buffer_poll(0)
     except KeyboardInterrupt:
         signal_handler(0, 0)
+        if csvfile:
+            csvfile.close()
+        print("\nTracing completed.")
         exit()

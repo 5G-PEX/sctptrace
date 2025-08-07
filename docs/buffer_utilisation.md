@@ -66,7 +66,6 @@ The `sctp_bufmon.py` tool uses eBPF to monitor buffer-related events in the kern
 1. Traces [sctp_outq_tail](https://elixir.bootlin.com/linux/v6.16/source/net/sctp/outqueue.c#L281) to track data being added to the outbound queue
 2. Traces [sctp_outq_flush](https://elixir.bootlin.com/linux/v6.16/source/net/sctp/outqueue.c#L1192) to monitor when the outbound queue is flushed for transmission
 3. Traces [sctp_wait_for_sndbuf](https://elixir.bootlin.com/linux/v6.16/source/net/sctp/socket.c#L9219) to detect when an application is blocked waiting for send buffer space
-4. Traces `sctp_write_space` to monitor when buffer space becomes available
 5. Calculates key metrics:
    - Send buffer utilisation percentage (used vs. total)
    - Outbound queue size over time

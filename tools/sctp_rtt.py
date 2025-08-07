@@ -14,6 +14,7 @@ from time import sleep, strftime
 import ctypes as ct
 import argparse
 import signal
+import csv
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
@@ -21,6 +22,10 @@ parser = argparse.ArgumentParser(
 parser.add_argument("-p", "--pid", type=int, help="trace this PID only")
 parser.add_argument("-i", "--interval", type=int, default=1,
     help="output interval, in seconds")
+parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+parser.add_argument(
+    "-f", "--file", metavar="FILE", help="Write output to a specified file"
+)
 args = parser.parse_args()
 
 # Define BPF program
@@ -241,41 +246,76 @@ class RTTEvent(ct.Structure):
         ("pid", ct.c_uint),
     ]
 
-# RTT calculation
 rtt_values = {}  # Now keyed by assoc_id
 print("Tracing SCTP RTT... Hit Ctrl-C to end")
-print("%-8s %-10s %-10s %-8s" % ("ASSOC", "TSN", "RTT(ms)", "TIME"))
+
+# Setup CSV file and writer if requested
+csvfile = None
+writer = None
+if args.file:
+    csvfile = open(args.file, "w", newline="")
+    writer = csv.writer(csvfile)
 
 # Process RTT events
 def process_rtt_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(RTTEvent)).contents
-    rtt_ms = float(event.rtt_ns) / 1000000
+    rtt_ms = float(event.rtt_ns) / 1000
+    tsn = event.tsn
+    assoc_id = event.assoc_id
+    timestamp = strftime("%H:%M:%S")
+
+    if not (args.csv or args.file):
+        print("%-8d %-10u %-10.3f %-8s" % 
+              (assoc_id, tsn, rtt_ms, timestamp))
     
     if event.assoc_id not in rtt_values:
         rtt_values[event.assoc_id] = []
     
     rtt_values[event.assoc_id].append(rtt_ms)
     
-    timestamp = strftime("%H:%M:%S")
-    print("%-8d %-10u %-10.3f %-8s" % 
-          (event.assoc_id, event.tsn, rtt_ms, timestamp))
-
 b["rtt_events"].open_perf_buffer(process_rtt_event)
 
-# Cleanup on keyboard interrupt
-def signal_handler(signal, frame):
-    print("\n=== RTT Summary ===")
+def print_summary():
     for assoc_id, rtts in sorted(rtt_values.items()):
         if rtts:
             avg_rtt = sum(rtts) / len(rtts)
-            print(f"Association {assoc_id}:")
-            print(f"  Samples: {len(rtts)}")
-            print(f"  Average RTT: {avg_rtt:.3f} ms")
-            print(f"  Min RTT: {min(rtts):.3f} ms")
-            print(f"  Max RTT: {max(rtts):.3f} ms")
+            if args.csv or args.file:
+                row = [
+                    assoc_id,
+                    len(rtts),
+                    f"{avg_rtt:.3f}",
+                    f"{min(rtts):.3f}",
+                    f"{max(rtts):.3f}"
+                ]
+                if args.file:
+                    writer.writerow(row)
+                else:
+                    print(",".join(map(str, row)))
+            else:
+                print(f"Association {assoc_id}:")
+                print(f"  Samples: {len(rtts)}")
+                print(f"  Average RTT: {avg_rtt:.3f} us")
+                print(f"  Min RTT: {min(rtts):.3f} us")
+                print(f"  Max RTT: {max(rtts):.3f} us")
+
+# Cleanup on keyboard interrupt
+def signal_handler(signal, frame):
+    print_summary()
     exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+
+if not args.csv and not args.file:
+    print("Tracing SCTP RTT... Ctrl+C to end")
+    print("%-8s %-10s %-10s %-8s" % ("ASSOC", "TSN", "RTT(ms)", "TIME"))
+elif args.csv:
+    # CSV to stdout, header already printed
+    print("Tracing SCTP RTT to stdout in CSV format... Ctrl+C to end")
+    print("assoc_id,samples,rtt_avg_us,rtt_min_us,rtt_max_us")
+else:
+    # Write CSV header to file
+    print(f"Tracing SCTP RTT to file '{args.file}'... Ctrl+C to end")
+    writer.writerow(["assoc_id", "samples", "rtt_avg_us", "rtt_min_us", "rtt_max_us"])
 
 # Main loop
 while True:
@@ -283,4 +323,7 @@ while True:
         b.perf_buffer_poll(timeout=args.interval * 1000)
     except KeyboardInterrupt:
         signal_handler(0, 0)
+        if csvfile:
+            csvfile.close()
+        print("\nTracing completed.")
         exit()

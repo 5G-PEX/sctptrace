@@ -14,12 +14,17 @@ import ctypes as ct
 import argparse
 import signal
 import collections
+import csv
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
     description="Measure SCTP packet reception jitter")
 parser.add_argument("-i", "--interval", type=int, default=1,
     help="output interval, in seconds")
+parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+parser.add_argument(
+    "-f", "--file", metavar="FILE", help="Write output to a specified file"
+)
 args = parser.parse_args()
 
 # Define BPF program
@@ -162,12 +167,18 @@ class JitterTracker:
 jitter_stats = {}  # (stream_id) -> JitterTracker
 
 print("Tracing SCTP packet reception jitter... Hit Ctrl-C to end")
-print("%-8s %-12s %-12s" % ("STREAM", "DELTA(ms)", "TIME"))
+
+# Setup CSV file and writer if requested
+csvfile = None
+writer = None
+if args.file:
+    csvfile = open(args.file, "w", newline="")
+    writer = csv.writer(csvfile)
 
 # Process jitter events
 def process_jitter_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(JitterEvent)).contents
-    delta_ms = float(event.delta_ns) / 1000000  # ns to ms
+    delta_ms = float(event.delta_ns) / 1000  # ns to us
     
     # Track jitter
     key = (event.stream_id)
@@ -177,28 +188,57 @@ def process_jitter_event(cpu, data, size):
     jitter_stats[key].update(delta_ms)
     
     timestamp = strftime("%H:%M:%S")
-    print("%-8d %-12.3f %-12s" % 
-          (event.stream_id, delta_ms, timestamp))
+
+    if not (args.csv or args.file):
+        print("%-8d %-12.3f %-12s" % 
+            (event.stream_id, delta_ms, timestamp))
 
 b["jitter_events"].open_perf_buffer(process_jitter_event)
 
-# Cleanup on keyboard interrupt
-def signal_handler(signal, frame):
-    print("\n=== Reception Jitter Summary ===")
+def print_summary():
     for (stream_id), tracker in sorted(jitter_stats.items()):
         if tracker.deltas:
             delta_avg = sum(tracker.deltas) / len(tracker.deltas) if tracker.deltas else 0
             delta_min = min(tracker.deltas) if tracker.deltas else 0
             delta_max = max(tracker.deltas) if tracker.deltas else 0
             
-            print(f"Stream {stream_id}:")
-            print(f"  Samples: {tracker.sample_count}")
-            print(f"  Avg packet arrival delta: {delta_avg:.3f} ms")
-            print(f"  Min/Max arrival delta: {delta_min:.3f}/{delta_max:.3f} ms")
-            print(f"  Reception jitter (RFC 3550): {tracker.jitter:.3f} ms")
+            if args.csv or args.file:
+                row = [
+                    stream_id,
+                    tracker.sample_count,
+                    f"{delta_avg:.3f}",
+                    f"{delta_min:.3f}",
+                    f"{delta_max:.3f}",
+                    f"{tracker.jitter:.3f}"
+
+                ]
+                if args.file:
+                    writer.writerow(row)
+                else:
+                    print(",".join(map(str, row)))
+            else:
+                print(f"Stream {stream_id}:")
+                print(f"  Samples: {tracker.sample_count}")
+                print(f"  Avg packet arrival delta: {delta_avg:.3f} us")
+                print(f"  Min/Max arrival delta: {delta_min:.3f}/{delta_max:.3f} us")
+                print(f"  Reception jitter (RFC 3550): {tracker.jitter:.3f} us")
+
+# Cleanup on keyboard interrupt
+def signal_handler(signal, frame):
+    print_summary()
     exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+
+if not args.csv and not args.file:
+    print("%-8s %-12s %-12s" % ("STREAM", "DELTA(ms)", "TIME"))
+elif args.csv:
+    # CSV to stdout, header already printed
+    print("stream_id,samples,delta_avg_us,delta_min_us,delta_max_us,jitter_us")
+else:
+    # Write CSV header to file
+    print(f"Tracing SCTP RTT to file '{args.file}'... Ctrl+C to end")
+    writer.writerow(["stream_id", "samples", "delta_avg_us", "delta_min_us", "delta_max_us", "jitter_us"])
 
 # Main loop
 while True:
@@ -206,4 +246,7 @@ while True:
         b.perf_buffer_poll(timeout=args.interval * 1000)
     except KeyboardInterrupt:
         signal_handler(0, 0)
+        if csvfile:
+            csvfile.close()
+        print("\nTracing completed.")
         exit()

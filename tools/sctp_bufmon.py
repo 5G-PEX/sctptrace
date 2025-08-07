@@ -15,12 +15,17 @@ import ctypes as ct
 import argparse
 import signal
 from collections import defaultdict
+import csv
 
 # Parse command line arguments
 parser = argparse.ArgumentParser(
     description="Monitor SCTP buffer utilisation")
 parser.add_argument("-i", "--interval", type=int, default=1,
     help="output interval, in seconds")
+parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+parser.add_argument(
+    "-f", "--file", metavar="FILE", help="Write output to a specified file"
+)
 args = parser.parse_args()
 
 # Define BPF program
@@ -279,8 +284,13 @@ class BufferStats:
 buffer_stats = {}  # (assoc_id) -> BufferStats
 
 print("Tracing SCTP buffer utilisation... Hit Ctrl-C to end")
-print("%-8s %-12s %-12s %-30s %-12s" % 
-      ("ASSOC", "EVENT", "OUTQ", "SNDBUF", "RWND"))
+
+# Setup CSV file and writer if requested
+csvfile = None
+writer = None
+if args.file:
+    csvfile = open(args.file, "w", newline="")
+    writer = csv.writer(csvfile)
 
 # Process buffer events
 def process_buffer_event(cpu, data, size):
@@ -308,47 +318,82 @@ def process_buffer_event(cpu, data, size):
     
     event_name = event_types.get(event.event_type, "UNKNOWN")
     
-    print("%-8d %-12s %-12d %-30s %-12d" % 
-          (event.association_id, event_name, 
-           event.outq_size, 
-           f"{event.sndbuf_used}/{event.sndbuf_total} ({buffer_util:.1f}%)",
-           event.rwnd))
+    # print("%-8d %-12s %-12d %-30s %-12d" % 
+    #       (event.association_id, event_name, 
+    #        event.outq_size, 
+    #        f"{event.sndbuf_used}/{event.sndbuf_total} ({buffer_util:.1f}%)",
+    #        event.rwnd))
 
 b["buffer_events"].open_perf_buffer(process_buffer_event)
 
 # Print buffer utilisation summary
 def print_summary():
-    print("\n=== Buffer utilisation Summary ===")
+
+    csv_mode = args.csv or args.file
+    # Iterate through the sorted buffer statistics
     for assoc_id, stats in sorted(buffer_stats.items()):
-        print(f"\nAssociation {assoc_id}:")
+        # Initialize values for the CSV row to 0 or None
+        avg_util = 0.0
+        min_util = 0.0
+        max_util = 0.0
+        avg_outq = 0.0
+        max_outq = 0.0
+        avg_rwnd = 0.0
+        min_rwnd = 0.0
+        
+        # All print statements are now conditional on `csv_file` not being defined.
+        if not csv_mode:
+            print(f"\nAssociation {assoc_id}:")
         
         # Buffer utilisation stats
         if stats.samples > 0:
             avg_util = stats.total_utilisation / stats.samples
-            print(f"  Send Buffer utilisation:")
-            print(f"    Average: {avg_util:.1f}%")
-            print(f"    Min/Max: {stats.min_utilisation:.1f}%/{stats.max_utilisation:.1f}%")
-            print(f"    Samples: {stats.samples}")
+            min_util = stats.min_utilisation
+            max_util = stats.max_utilisation
+            if not csv_mode:
+                print(f"  Send Buffer utilisation:")
+                print(f"    Average: {avg_util:.1f}%")
+                print(f"    Min/Max: {min_util:.1f}%/{max_util:.1f}%")
+                print(f"    Samples: {stats.samples}")
         
         # Outqueue stats
         if stats.outq_samples > 0:
             avg_outq = stats.total_outq_size / stats.outq_samples
-            print(f"  Outqueue Size:")
-            print(f"    Average: {avg_outq:.1f} bytes")
-            print(f"    Maximum: {stats.max_outq_size} bytes")
-            print(f"    Samples: {stats.outq_samples}")
+            max_outq = stats.max_outq_size
+            if not csv_mode:
+                print(f"  Outqueue Size:")
+                print(f"    Average: {avg_outq:.1f} bytes")
+                print(f"    Maximum: {max_outq} bytes")
+                print(f"    Samples: {stats.outq_samples}")
         
         # RWND stats
         if stats.rwnd_samples > 0:
             avg_rwnd = stats.total_rwnd / stats.rwnd_samples
-            print(f"  Receiver Window (RWND):")
-            print(f"    Average: {avg_rwnd:.1f} bytes")
-            print(f"    Minimum: {stats.min_rwnd} bytes")
-            print(f"    Samples: {stats.rwnd_samples}")
+            min_rwnd = stats.min_rwnd
+            if not csv_mode:
+                print(f"  Receiver Window (RWND):")
+                print(f"    Average: {avg_rwnd:.1f} bytes")
+                print(f"    Minimum: {min_rwnd} bytes")
+                print(f"    Samples: {stats.rwnd_samples}")
         
         # Buffer pressure events
-        print(f"  Send Buffer Pressure:")
-        print(f"    Wait events: {stats.sndbuf_wait_count}")
+        sndbuf_wait_count = stats.sndbuf_wait_count
+        if not csv_mode:
+            print(f"  Send Buffer Pressure:")
+            print(f"    Wait events: {sndbuf_wait_count}")
+
+        if csv_mode:
+            row = [
+                assoc_id,
+                f"{avg_util:.1f}", f"{min_util:.1f}", f"{max_util:.1f}", stats.samples,
+                f"{avg_outq:.1f}", max_outq, stats.outq_samples,
+                f"{avg_rwnd:.1f}", min_rwnd, stats.rwnd_samples,
+                sndbuf_wait_count
+            ]
+            if args.file:
+                writer.writerow(row)
+            else:
+                print(",".join(map(str, row)))
 
 # Cleanup on keyboard interrupt
 def signal_handler(signal, frame):
@@ -357,13 +402,30 @@ def signal_handler(signal, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
+header = [
+        "Association ID", "Avg_Util_%", "Min_Util_%", "Max_Util_%", "Util_Samples",
+        "Avg_Outqueue_bytes", "Max_Outqueue_bytes", "Outqueue_Samples",
+        "Avg_RWND_bytes", "Min_RWND_bytes", "RWND_Samples",
+        "Sndbuf_Wait_Events"
+    ]
+
+if args.csv:
+    # CSV to stdout, header already printed
+    print(",".join(map(str, header)))
+else:
+    # Write CSV header to file
+    writer.writerow(header)
+
 # Main loop with periodic summaries
 while True:
     try:
         sleep(args.interval)
         b.perf_buffer_poll(0)
-        if args.interval >= 5:  # Only print summary for longer intervals
-            print_summary()
+        # if args.interval >= 5:  # Only print summary for longer intervals
+        #     print_summary()
     except KeyboardInterrupt:
         signal_handler(0, 0)
+        if csvfile:
+            csvfile.close()
+        print("\nTracing completed.")
         exit()

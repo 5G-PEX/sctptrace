@@ -56,10 +56,9 @@ flowchart TD
 
 The `sctp_streamutil.py` tool uses eBPF to monitor stream usage patterns:
 
-1. Traces the `sctp_make_data_chunk()` function to track chunk creation
-2. Traces the `sctp_chunk_output()` function to monitor actual transmission
-3. Tracks per-stream data volumes and chunk counts
-4. Calculates stream Utilisation metrics including SUI and stream parallelism
+1. Traces the [sctp_packet_transmit_chunk](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/output.c#L180) function to track chunk creation
+2. Tracks per-stream data volumes and chunk counts
+3. Calculates stream Utilisation metrics including SUI and stream parallelism
 
 Example usage:
 ```bash

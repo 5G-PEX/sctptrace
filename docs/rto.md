@@ -58,8 +58,8 @@ flowchart TD
 
 The `sctp_rto.py` tool uses eBPF to monitor RTO-related events in the kernel:
 
-1. Traces the [sctp_transport_update_rto()](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/transport.c#L488) function to capture RTO updates
-2. Traces the [sctp_generate_t3_rtx_event()](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/sm_sideeffect.c#L231) function to capture retransmission events
+1. Traces the [sctp_transport_update_rto](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/transport.c#L488) function to capture RTO updates
+2. Traces the [sctp_generate_t3_rtx_event](https://elixir.bootlin.com/linux/v6.8/source/net/sctp/sm_sideeffect.c#L231) function to capture retransmission events
 3. Tracks SRTT and RTTVAR values used in RTO calculation
 4. Monitors RTO exponential backoff during retransmissions
 

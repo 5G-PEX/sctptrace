@@ -1,0 +1,65 @@
+# ====== sctptrace .gitignore =====
+# This file is used to ignore files and directories that should not be tracked by Git
+output/
+logs/
+temp/
+*.log
+
+
+# ===== python project .gitignore =====
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+eggs/
+*.egg-info/
+*.egg
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+.coverage
+.tox/
+.pytest_cache/
+nosetests.xml
+
+# Translations
+*.mo
+*.pot
+
+# Django Stuff
+*.log
+local_settings.py
+
+# Jupyter Notebooks
+.ipynb_checkpoints
+
+# Virtual environment
+.env/
+venv/
+.venv
+env/
+/venv
+/env
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Miscellaneous
+/media/
+/static/
+/db.sqlite3

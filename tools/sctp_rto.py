@@ -2,6 +2,10 @@
 from bcc import BPF
 from time import sleep, strftime
 import ctypes as ct
+import argparse
+import socket
+import struct
+import csv
 
 # Define BPF program
 bpf_text = """
@@ -92,6 +96,16 @@ int kprobe__sctp_generate_t3_rtx_event(struct pt_regs *ctx, struct timer_list *t
 }
 """
 
+# Argument parsing
+parser = argparse.ArgumentParser(
+    description="Trace SCTP RTO updates and retransmissions"
+)
+parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+parser.add_argument(
+    "-f", "--file", metavar="FILE", help="Write output to a specified file"
+)
+args = parser.parse_args()
+
 # Load BPF program
 b = BPF(text=bpf_text)
 
@@ -107,16 +121,24 @@ class RTOEvent(ct.Structure):
         ("addr_type", ct.c_ubyte),
     ]
 
-import socket
-import struct
+
+# Setup CSV file and writer if requested
+csvfile = None
+writer = None
+if args.file:
+    csvfile = open(args.file, "w", newline="")
+    writer = csv.writer(csvfile)
+    
+
 
 # Process RTO events
 def process_rto_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(RTOEvent)).contents
+    
     rto_ms = float(event.rto_us) / 1000
     srtt_ms = float(event.srtt_us) / 1000 if event.srtt_us else 0
     rttvar_ms = float(event.rttvar_us) / 1000 if event.rttvar_us else 0
-    
+
     # Format IP address if available
     ip_str = "N/A"
     port = 0
@@ -124,17 +146,47 @@ def process_rto_event(cpu, data, size):
         ip_str = socket.inet_ntoa(struct.pack("I", event.ipv4_addr))
         port = socket.ntohs(event.port)
     
-    print(f"Transport: {event.transport_id}, "
-          f"Addr: {ip_str}:{port}, "
-          f"RTO: {rto_ms:.3f} ms, SRTT: {srtt_ms:.3f} ms, RTTVAR: {rttvar_ms:.3f} ms")
+    if args.csv or args.file:
+        row = [
+            event.transport_id,
+            ip_str,
+            port,
+            f"{rto_ms:.3f}",
+            f"{srtt_ms:.3f}",
+            f"{rttvar_ms:.3f}",
+        ]
+        if args.file:
+            writer.writerow(row)
+        else:
+            print(",".join(map(str, row)))
+    else:
+        print(
+            f"Transport: {event.transport_id}, "
+            f"Addr: {ip_str}:{port}, "
+            f"RTO: {rto_ms:.3f} ms, SRTT: {srtt_ms:.3f} ms, RTTVAR: {rttvar_ms:.3f} ms"
+        )
+
 
 b["rto_events"].open_perf_buffer(process_rto_event)
 
 # Main loop
-print("Tracing SCTP RTO... Ctrl+C to end")
+if not args.csv and not args.file:
+    print("Tracing SCTP RTO... Ctrl+C to end")
+elif args.file:
+    # Write CSV header to file
+    print(f"Tracing SCTP RTO to file '{args.file}'... Ctrl+C to end")
+    writer.writerow(["transport_id", "ip_address", "port", "rto_ms", "srtt_ms", "rttvar_ms"])
+else:
+    # CSV to stdout, header already printed
+    print("Tracing SCTP RTO to stdout in CSV format... Ctrl+C to end")
+    print("transport_id,ip_address,port,rto_ms,srtt_ms,rttvar_ms")
+
 try:
     while True:
         b.perf_buffer_poll()
         sleep(0.1)
 except KeyboardInterrupt:
     print("\nTracing completed.")
+finally:
+    if csvfile:
+        csvfile.close()
