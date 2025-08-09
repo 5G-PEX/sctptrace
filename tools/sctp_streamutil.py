@@ -18,17 +18,7 @@ import signal
 import math
 from collections import defaultdict
 import csv
-
-# Parse command line arguments
-parser = argparse.ArgumentParser(
-    description="Analyze SCTP stream utilisation")
-parser.add_argument("-i", "--interval", type=int, default=5,
-    help="summary interval, in seconds")
-parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
-parser.add_argument(
-    "-f", "--file", metavar="FILE", help="Write output to a specified file"
-)
-args = parser.parse_args()
+import os
 
 # Define BPF program
 bpf_text = """
@@ -116,25 +106,9 @@ int kprobe__sctp_packet_transmit_chunk(struct pt_regs *ctx,
     stream_events.perf_submit(ctx, &event, sizeof(event));
     return 0;
 }
-
-// Also monitor stream initialization to track total streams with updated signature
-int kprobe__sctp_stream_init(struct pt_regs *ctx, 
-                             struct sctp_stream *stream, 
-                             __u16 outcnt, __u16 incnt,
-                             gfp_t gfp) {
-    // Function signature: sctp_stream_init(struct sctp_stream *stream, u16 outcnt, u16 incnt, gfp_t gfp)
-    // Can be used to track max stream count
-    
-    // For now, we're just tracing packet transmission, but this could be extended
-    // to track the number of streams allocated per association.
-    return 0;
-}
 """
 
-# Load BPF program
-b = BPF(text=bpf_text)
-
-# Stream data event structure
+# Stream event structure
 class StreamEvent(ct.Structure):
     _fields_ = [
         ("association_id", ct.c_uint),
@@ -159,131 +133,209 @@ class StreamStats:
         else:
             self.ordered_chunks += 1
 
-# Association statistics
-associations = {}  # (assoc_id) -> {stream_id -> StreamStats}
-
-print("Tracing SCTP stream utilisation... Hit Ctrl-C to end")
-
-# Setup CSV file and writer if requested
-csvfile = None
-writer = None
-if args.file:
-    csvfile = open(args.file, "w", newline="")
-    writer = csv.writer(csvfile)
-
-# Process stream events
-def process_stream_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(StreamEvent)).contents
-    
-    # Track per-stream stats
-    assoc_key = (event.association_id)
-    if assoc_key not in associations:
-        associations[assoc_key] = defaultdict(StreamStats)
-    
-    stream_stats = associations[assoc_key][event.stream_id]
-    stream_stats.update(event.data_bytes, event.is_unordered)
-
-b["stream_events"].open_perf_buffer(process_stream_event)
-
-# Calculate stream utilisation index (entropy-based measure)
-def calculate_sui(stream_bytes):
-    total_bytes = sum(stream_bytes.values())
-    if total_bytes == 0:
-        return 0
-    
-    # Calculate SUI using Shannon entropy
-    stream_count = len(stream_bytes)
-    if stream_count <= 1:
-        return 0
-    
-    entropy = 0
-    for bytes_sent in stream_bytes.values():
-        if bytes_sent > 0:
-            p = bytes_sent / total_bytes
-            entropy -= p * math.log2(p)
-    
-    # Normalize by maximum possible entropy
-    max_entropy = math.log2(stream_count)
-    return entropy / max_entropy if max_entropy > 0 else 0
-
-# Print utilisation summary
-def print_summary():
-    for (assoc_id), streams in sorted(associations.items()):
+class SCTPStreamTracer:
+    def __init__(self, interval=5, csv_output=False, output_file=None):
+        self.interval = interval
+        self.csv_output = csv_output
+        self.output_file = output_file
+        self.b = None
+        self.csvfile = None
+        self.writer = None
+        # Keep original variable name for association tracking
+        self.associations = {}  # (assoc_id) -> {stream_id -> StreamStats}
+        self._setup_complete = False
         
-        # Collect stream statistics
-        total_bytes = 0
-        total_chunks = 0
-        stream_bytes = {}
-        ordered_vs_unordered = [0, 0]  # [ordered, unordered]
-        
-        for stream_id, stats in sorted(streams.items()):
-            if not (args.csv or args.file):
-                print(f"  Stream {stream_id}: {stats.bytes_sent} bytes, {stats.chunks_sent} chunks "
-                  f"({stats.ordered_chunks} ordered, {stats.unordered_chunks} unordered)")
+    def setup(self):
+        if self._setup_complete:
+            return
             
-            total_bytes += stats.bytes_sent
-            total_chunks += stats.chunks_sent
-            stream_bytes[stream_id] = stats.bytes_sent
-            ordered_vs_unordered[0] += stats.ordered_chunks
-            ordered_vs_unordered[1] += stats.unordered_chunks
+        # Load BPF program
+        self.b = BPF(text=bpf_text)
         
-        # Calculate stream utilisation index
-        sui = calculate_sui(stream_bytes)
+        # Setup CSV file and writer if requested
+        if self.output_file:
+            output_dir = os.path.dirname(self.output_file)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                
+            self.csvfile = open(self.output_file, "w", newline="")
+            self.writer = csv.writer(self.csvfile)
+            self.writer.writerow([
+                "assoc_id", 
+                "total_streams", 
+                "active_streams", 
+                "total_bytes", 
+                "total_chunks", 
+                "ordered", 
+                "unordered", 
+                "sui", 
+                "stream_parallelism"
+            ])
         
-        # Calculate stream parallelism
-        active_streams = len([b for b in stream_bytes.values() if b > 0])
-        stream_parallelism = active_streams / len(streams) if streams else 0
-
-        if args.csv or args.file:
-            row = [
-                assoc_id, 
-                len(streams),
-                active_streams,
-                total_bytes,
-                total_chunks,
-                ordered_vs_unordered[0],
-                ordered_vs_unordered[1],
-                f"{sui:.3f}",
-                f"{stream_parallelism:.3f}"
-            ]
-            if args.file:
-                writer.writerow(row)
+        # Set up perf buffer for events
+        self.b["stream_events"].open_perf_buffer(self._process_stream_event)
+        self._setup_complete = True
+        
+    def _process_stream_event(self, cpu, data, size):
+        event = ct.cast(data, ct.POINTER(StreamEvent)).contents
+        
+        # Track per-stream stats
+        assoc_key = (event.association_id)
+        if assoc_key not in self.associations:
+            self.associations[assoc_key] = defaultdict(StreamStats)
+        
+        stream_stats = self.associations[assoc_key][event.stream_id]
+        stream_stats.update(event.data_bytes, event.is_unordered)
+    
+    def poll_events(self, timeout=None):
+        """Poll for events with optional timeout (in ms)"""
+        if not self._setup_complete:
+            self.setup()
+        if timeout is None:
+            timeout = self.interval * 1000
+        self.b.perf_buffer_poll(timeout=timeout)
+    
+    # Calculate stream utilisation index (entropy-based measure)
+    # Keeping the original function
+    def calculate_sui(self, stream_bytes):
+        total_bytes = sum(stream_bytes.values())
+        if total_bytes == 0:
+            return 0
+        
+        # Calculate SUI using Shannon entropy
+        stream_count = len(stream_bytes)
+        if stream_count <= 1:
+            return 0
+        
+        entropy = 0
+        for bytes_sent in stream_bytes.values():
+            if bytes_sent > 0:
+                p = bytes_sent / total_bytes
+                entropy -= p * math.log2(p)
+        
+        # Normalize by maximum possible entropy
+        max_entropy = math.log2(stream_count)
+        return entropy / max_entropy if max_entropy > 0 else 0
+    
+    def get_summary(self):
+        """Return summary statistics for collected data"""
+        results = []
+        for assoc_id, streams in sorted(self.associations.items()):
+            # Calculate total statistics
+            total_streams = len(streams)
+            active_streams = sum(1 for stats in streams.values() if stats.bytes_sent > 0)
+            total_bytes = sum(stats.bytes_sent for stats in streams.values())
+            total_chunks = sum(stats.chunks_sent for stats in streams.values())
+            ordered_chunks = sum(stats.ordered_chunks for stats in streams.values())
+            unordered_chunks = sum(stats.unordered_chunks for stats in streams.values())
+            
+            # Get bytes per stream for SUI calculation
+            stream_bytes = {stream_id: stats.bytes_sent for stream_id, stats in streams.items()}
+            sui = self.calculate_sui(stream_bytes)
+            
+            # Calculate stream parallelism (% of streams that are active)
+            stream_parallelism = (active_streams / total_streams * 100) if total_streams > 0 else 0
+            
+            results.append({
+                'assoc_id': assoc_id,
+                'total_streams': total_streams,
+                'active_streams': active_streams,
+                'total_bytes': total_bytes,
+                'total_chunks': total_chunks,
+                'ordered_chunks': ordered_chunks,
+                'unordered_chunks': unordered_chunks,
+                'sui': sui,
+                'stream_parallelism': stream_parallelism
+            })
+        return results
+    
+    def print_summary(self):
+        """Print or write summary data based on output mode"""
+        results = self.get_summary()
+        
+        if not results:
+            return
+            
+        for result in results:
+            if self.csv_output or self.output_file:
+                row = [
+                    result['assoc_id'],
+                    result['total_streams'],
+                    result['active_streams'],
+                    result['total_bytes'],
+                    result['total_chunks'],
+                    result['ordered_chunks'],
+                    result['unordered_chunks'],
+                    f"{result['sui']:.4f}",
+                    f"{result['stream_parallelism']:.1f}"
+                ]
+                if self.output_file:
+                    self.writer.writerow(row)
+                elif self.csv_output:
+                    print(",".join(map(str, row)))
             else:
-                print(",".join(map(str, row)))
-        else:
-            print("\n=== Stream utilisation Summary ===")
-            print(f"\nAssociation {assoc_id}:")
-            print(f"  Total streams: {len(streams)}, Active streams: {active_streams}")
-            print(f"  Total data: {total_bytes} bytes, {total_chunks} chunks")
-            print(f"  Ordered vs Unordered ratio: {ordered_vs_unordered[0]}:{ordered_vs_unordered[1]}")
-            print(f"  Stream utilisation Index: {sui:.3f} (0=imbalanced, 1=balanced)")
-            print(f"  Stream Parallelism: {stream_parallelism:.3f}")
+                # Plain text output
+                print(f"Association {result['assoc_id']}:")
+                print(f"  Streams: {result['active_streams']} active out of {result['total_streams']} total")
+                print(f"  Data: {result['total_bytes']} bytes across {result['total_chunks']} chunks")
+                print(f"  Ordering: {result['ordered_chunks']} ordered, {result['unordered_chunks']} unordered")
+                print(f"  Stream Utilization Index: {result['sui']:.4f}")
+                print(f"  Stream Parallelism: {result['stream_parallelism']:.1f}%")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.csvfile:
+            self.csvfile.close()
 
-# Cleanup on keyboard interrupt
-def signal_handler(signal, frame):
-    print_summary()
-    exit(0)
+def parse_args():
+    # Parse command line arguments - keeping same args
+    parser = argparse.ArgumentParser(
+        description="Analyze SCTP stream utilisation")
+    parser.add_argument("-i", "--interval", type=int, default=5,
+        help="summary interval, in seconds")
+    parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+    parser.add_argument(
+        "-f", "--file", metavar="FILE", help="Write output to a specified file"
+    )
+    return parser.parse_args()
 
-signal.signal(signal.SIGINT, signal_handler)
+def signal_handler(signal, frame, tracer):
+    tracer.print_summary()
+    tracer.cleanup()
+    print("\nTracing completed.")
+    exit()
 
-if args.csv:
-    # CSV to stdout, header already printed
-    print("Tracing SCTP RTT to stdout in CSV format... Ctrl+C to end")
-    print("assoc_id,total_streams,active_streams,total_bytes,total_chunks,ordered,unordered,sui,stream_parallelism")
-else:
-    # Write CSV header to file
-    print(f"Tracing SCTP RTT to file '{args.file}'... Ctrl+C to end")
-    writer.writerow(["assoc_id", "total_streams", "active_streams", "total_bytes", "total_chunks", "ordered", "unordered", "sui", "stream_parallelism"])
-
-# Main loop with periodic summaries
-while True:
+def main():
+    args = parse_args()
+    
+    tracer = SCTPStreamTracer(
+        interval=args.interval,
+        csv_output=args.csv,
+        output_file=args.file
+    )
+    tracer.setup()
+    
+    # Set up signal handler for clean exit
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, tracer))
+    
+    if args.csv:
+        # CSV to stdout, header already printed
+        print("Tracing SCTP RTT to stdout in CSV format... Ctrl+C to end")
+        print("assoc_id,total_streams,active_streams,total_bytes,total_chunks,ordered,unordered,sui,stream_parallelism")
+    else:
+        # Write CSV header to file
+        print(f"Tracing SCTP stream utilization... Ctrl+C to end")
+    
+    # Main loop
     try:
-        sleep(args.interval)
-        print_summary()
-        b.perf_buffer_poll(0)
+        while True:
+            tracer.poll_events()
+            sleep(args.interval)
+            # Only print summaries in standalone mode at interval
+            if not args.csv and not args.file:
+                tracer.print_summary()
     except KeyboardInterrupt:
-        signal_handler(0, 0)
-        if csvfile:
-            csvfile.close()
-        print("\nTracing completed.")
-        exit()
+        signal_handler(0, 0, tracer)
+
+if __name__ == "__main__":
+    main()

@@ -16,18 +16,6 @@ import argparse
 import signal
 import csv
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(
-    description="Measure SCTP Round Trip Time (RTT)")
-parser.add_argument("-p", "--pid", type=int, help="trace this PID only")
-parser.add_argument("-i", "--interval", type=int, default=1,
-    help="output interval, in seconds")
-parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
-parser.add_argument(
-    "-f", "--file", metavar="FILE", help="Write output to a specified file"
-)
-args = parser.parse_args()
-
 # Define BPF program
 bpf_text = """
 #include <uapi/linux/ptrace.h>
@@ -225,16 +213,6 @@ int kprobe__sctp_sf_eat_sack_6_2(struct pt_regs *ctx) {
 }
 """
 
-# Set up pid filter if specified
-if args.pid:
-    bpf_text = bpf_text.replace('FILTER_PID',
-        'if (pid != %d) { return 0; }' % args.pid)
-else:
-    bpf_text = bpf_text.replace('FILTER_PID', '')
-
-# Load BPF program
-b = BPF(text=bpf_text)
-
 # RTT event structure
 class RTTEvent(ct.Structure):
     _fields_ = [
@@ -246,84 +224,167 @@ class RTTEvent(ct.Structure):
         ("pid", ct.c_uint),
     ]
 
-rtt_values = {}  # Now keyed by assoc_id
-print("Tracing SCTP RTT... Hit Ctrl-C to end")
+class SCTPRttTracer:
+    def __init__(self, pid=None, interval=1, csv_output=False, output_file=None):
+        self.pid = pid
+        self.interval = interval
+        self.csv_output = csv_output
+        self.output_file = output_file
+        self.b = None
+        self.csvfile = None
+        self.writer = None
+        self.rtt_values = {}
+        self._setup_complete = False
 
-# Setup CSV file and writer if requested
-csvfile = None
-writer = None
-if args.file:
-    csvfile = open(args.file, "w", newline="")
-    writer = csv.writer(csvfile)
+    def setup(self):
+        if self._setup_complete:
+            return
+            
+        # Set up pid filter if specified
+        bpf_text_copy = bpf_text
+        if self.pid:
+            bpf_text_copy = bpf_text_copy.replace('FILTER_PID', 
+                'if (pid != %d) { return 0; }' % self.pid)
+        else:
+            bpf_text_copy = bpf_text_copy.replace('FILTER_PID', '')
 
-# Process RTT events
-def process_rtt_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(RTTEvent)).contents
-    rtt_ms = float(event.rtt_ns) / 1000
-    tsn = event.tsn
-    assoc_id = event.assoc_id
-    timestamp = strftime("%H:%M:%S")
+        # Load BPF program
+        self.b = BPF(text=bpf_text_copy)
+        
+        # Setup CSV file and writer if requested
+        if self.output_file:
+            self.csvfile = open(self.output_file, "w", newline="")
+            self.writer = csv.writer(self.csvfile)
+            self.writer.writerow(["assoc_id", "samples", "rtt_avg_us", "rtt_min_us", "rtt_max_us"])
+        
+        # Set up perf buffer for events
+        self.b["rtt_events"].open_perf_buffer(self._process_rtt_event)
+        self._setup_complete = True
 
-    if not (args.csv or args.file):
-        print("%-8d %-10u %-10.3f %-8s" % 
-              (assoc_id, tsn, rtt_ms, timestamp))
+    def _process_rtt_event(self, cpu, data, size):
+        # Same event processing as before, but store data instead of printing
+        event = ct.cast(data, ct.POINTER(RTTEvent)).contents
+        rtt_ms = float(event.rtt_ns) / 1000
+        tsn = event.tsn
+        assoc_id = event.assoc_id
+        timestamp = strftime("%H:%M:%S")
+
+        if not (self.csv_output or self.output_file):
+            print("%-8d %-10u %-10.3f %-8s" % 
+                (assoc_id, tsn, rtt_ms, timestamp))
+
+        # Collect data but don't print (run.py will handle printing)
+        if event.assoc_id not in self.rtt_values:
+            self.rtt_values[event.assoc_id] = []
+        
+        self.rtt_values[event.assoc_id].append(rtt_ms)
     
-    if event.assoc_id not in rtt_values:
-        rtt_values[event.assoc_id] = []
+    def poll_events(self, timeout=None):
+        """Poll for events with optional timeout (in ms)"""
+        if not self._setup_complete:
+            self.setup()
+        if timeout is None:
+            timeout = self.interval * 1000
+        self.b.perf_buffer_poll(timeout=timeout)
     
-    rtt_values[event.assoc_id].append(rtt_ms)
+    def get_summary(self):
+        """Return summary statistics for collected data"""
+        results = []
+        for assoc_id, rtts in self.rtt_values.items():
+            if not rtts:
+                continue
+            samples = len(rtts)
+            rtt_avg_us = sum(rtts) * 1000 / samples
+            rtt_min_us = min(rtts) * 1000
+            rtt_max_us = max(rtts) * 1000
+            results.append({
+                'assoc_id': assoc_id,
+                'samples': samples,
+                'rtt_avg_us': rtt_avg_us,
+                'rtt_min_us': rtt_min_us,
+                'rtt_max_us': rtt_max_us
+            })
+        return results
     
-b["rtt_events"].open_perf_buffer(process_rtt_event)
-
-def print_summary():
-    for assoc_id, rtts in sorted(rtt_values.items()):
-        if rtts:
-            avg_rtt = sum(rtts) / len(rtts)
-            if args.csv or args.file:
+    def print_summary(self):
+        """Print or write summary data based on output mode"""
+        results = self.get_summary()
+        
+        for result in results:
+            if self.csv_output:
                 row = [
-                    assoc_id,
-                    len(rtts),
-                    f"{avg_rtt:.3f}",
-                    f"{min(rtts):.3f}",
-                    f"{max(rtts):.3f}"
+                    result['assoc_id'],
+                    result['samples'],
+                    result['rtt_avg_us'],
+                    result['rtt_min_us'],
+                    result['rtt_max_us']
                 ]
-                if args.file:
-                    writer.writerow(row)
+                if self.output_file:
+                    self.writer.writerow(row)
                 else:
                     print(",".join(map(str, row)))
             else:
-                print(f"Association {assoc_id}:")
-                print(f"  Samples: {len(rtts)}")
-                print(f"  Average RTT: {avg_rtt:.3f} us")
-                print(f"  Min RTT: {min(rtts):.3f} us")
-                print(f"  Max RTT: {max(rtts):.3f} us")
+                print(f"Association {result['assoc_id']}:")
+                print(f"  Samples: {result['samples']}")
+                print(f"  Avg RTT: {result['rtt_avg_us']:.3f} us")
+                print(f"  Min/Max RTT: {result['rtt_min_us']:.3f}/{result['rtt_max_us']:.3f} us")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.csvfile:
+            self.csvfile.close()
+
+def parse_args():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Measure SCTP Round Trip Time (RTT)")
+    parser.add_argument("-p", "--pid", type=int, help="trace this PID only")
+    parser.add_argument("-i", "--interval", type=int, default=1,
+        help="output interval, in seconds")
+    parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+    parser.add_argument(
+        "-f", "--file", metavar="FILE", help="Write output to a specified file"
+    )
+    return parser.parse_args()
 
 # Cleanup on keyboard interrupt
-def signal_handler(signal, frame):
-    print_summary()
-    exit(0)
+def signal_handler(signal, frame, tracer):
+    tracer.print_summary()
+    tracer.cleanup()
+    print("\nTracing completed.")
+    exit()
 
-signal.signal(signal.SIGINT, signal_handler)
+def main():
+    args = parse_args()
+    
+    tracer = SCTPRttTracer(
+        pid=args.pid,
+        interval=args.interval,
+        csv_output=args.csv,
+        output_file=args.file
+    )
+    tracer.setup()
+    
+    # Set up signal handler for clean exit
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, tracer))
 
-if not args.csv and not args.file:
-    print("Tracing SCTP RTT... Ctrl+C to end")
-    print("%-8s %-10s %-10s %-8s" % ("ASSOC", "TSN", "RTT(ms)", "TIME"))
-elif args.csv:
-    # CSV to stdout, header already printed
-    print("Tracing SCTP RTT to stdout in CSV format... Ctrl+C to end")
-    print("assoc_id,samples,rtt_avg_us,rtt_min_us,rtt_max_us")
-else:
-    # Write CSV header to file
-    print(f"Tracing SCTP RTT to file '{args.file}'... Ctrl+C to end")
-    writer.writerow(["assoc_id", "samples", "rtt_avg_us", "rtt_min_us", "rtt_max_us"])
+    if not args.csv and not args.file:
+        print("Tracing SCTP RTT... Ctrl+C to end")
+        print("%-8s %-10s %-10s %-8s" % ("ASSOC", "TSN", "RTT(ms)", "TIME"))
+    elif args.csv:
+        # CSV to stdout, header already printed
+        print("Tracing SCTP RTT to stdout in CSV format... Ctrl+C to end")
+        print("assoc_id,samples,rtt_avg_us,rtt_min_us,rtt_max_us")
+    else:
+        # Write CSV header to file
+        print(f"Tracing SCTP RTT to file '{args.file}'... Ctrl+C to end")
 
-# Main loop
-while True:
-    try:
-        b.perf_buffer_poll(timeout=args.interval * 1000)
-    except KeyboardInterrupt:
-        signal_handler(0, 0)
-        if csvfile:
-            csvfile.close()
-        print("\nTracing completed.")
-        exit()
+    # Main loop
+    while True:
+        try:
+            tracer.poll_events()
+        except KeyboardInterrupt:
+            signal_handler(0, 0, tracer)
+
+if __name__ == "__main__":
+    main()

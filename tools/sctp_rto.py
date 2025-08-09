@@ -6,6 +6,7 @@ import argparse
 import socket
 import struct
 import csv
+import os
 
 # Define BPF program
 bpf_text = """
@@ -96,19 +97,6 @@ int kprobe__sctp_generate_t3_rtx_event(struct pt_regs *ctx, struct timer_list *t
 }
 """
 
-# Argument parsing
-parser = argparse.ArgumentParser(
-    description="Trace SCTP RTO updates and retransmissions"
-)
-parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
-parser.add_argument(
-    "-f", "--file", metavar="FILE", help="Write output to a specified file"
-)
-args = parser.parse_args()
-
-# Load BPF program
-b = BPF(text=bpf_text)
-
 # RTO event structure
 class RTOEvent(ct.Structure):
     _fields_ = [
@@ -121,72 +109,207 @@ class RTOEvent(ct.Structure):
         ("addr_type", ct.c_ubyte),
     ]
 
-
-# Setup CSV file and writer if requested
-csvfile = None
-writer = None
-if args.file:
-    csvfile = open(args.file, "w", newline="")
-    writer = csv.writer(csvfile)
+class SCTPRtoTracer:
+    def __init__(self, interval=1, csv_output=False, output_file=None):
+        self.interval = interval
+        self.csv_output = csv_output
+        self.output_file = output_file
+        self.b = None
+        self.csvfile = None
+        self.writer = None
+        # Track RTO values per transport - new data structure
+        self.rto_values = {}  # (transport_id) -> [rto_values]
+        self.transport_info = {}  # (transport_id) -> address info
+        self._setup_complete = False
+        
+    def setup(self):
+        if self._setup_complete:
+            return
+            
+        # Load BPF program
+        self.b = BPF(text=bpf_text)
+        
+        # Setup CSV file and writer if requested
+        if self.output_file:
+            output_dir = os.path.dirname(self.output_file)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                
+            self.csvfile = open(self.output_file, "w", newline="")
+            self.writer = csv.writer(self.csvfile)
+            self.writer.writerow([
+                "transport_id", 
+                "ip_address",
+                "port",
+                "samples", 
+                "rto_avg_ms", 
+                "srtt_avg_ms", 
+                "rttvar_avg_ms"
+            ])
+        
+        # Set up perf buffer for events
+        self.b["rto_events"].open_perf_buffer(self._process_rto_event)
+        self._setup_complete = True
+        
+    def _process_rto_event(self, cpu, data, size):
+        event = ct.cast(data, ct.POINTER(RTOEvent)).contents
+        
+        rto_ms = float(event.rto_us) / 1000
+        srtt_ms = float(event.srtt_us) / 1000 if event.srtt_us else 0
+        rttvar_ms = float(event.rttvar_us) / 1000 if event.rttvar_us else 0
+        
+        # Format IP address for IPv4
+        ip_str = ""
+        if event.addr_type == socket.AF_INET:  # IPv4
+            ipv4_bytes = struct.pack("I", event.ipv4_addr)
+            ip_str = socket.inet_ntop(socket.AF_INET, ipv4_bytes)
+            port = socket.ntohs(event.port)
+        
+        # Store transport info for summary
+        transport_id = event.transport_id
+        if transport_id not in self.transport_info:
+            self.transport_info[transport_id] = {
+                'ip': ip_str,
+                'port': port
+            }
+        
+        # Store RTO values for summary
+        if transport_id not in self.rto_values:
+            self.rto_values[transport_id] = []
+        
+        self.rto_values[transport_id].append({
+            'rto': rto_ms,
+            'srtt': srtt_ms,
+            'rttvar': rttvar_ms
+        })
+        
+        # Print event details in non-CSV mode
+        if not (self.csv_output or self.output_file):
+            timestamp = strftime("%H:%M:%S")
+            print("%-12d %-15s %-6d %-10.2f %-10.2f %-10.2f %-12s" % 
+                  (transport_id, ip_str, port, 
+                   rto_ms, srtt_ms, rttvar_ms, timestamp))
     
-
-
-# Process RTO events
-def process_rto_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(RTOEvent)).contents
+    def poll_events(self, timeout=None):
+        """Poll for events with optional timeout (in ms)"""
+        if not self._setup_complete:
+            self.setup()
+        if timeout is None:
+            timeout = self.interval * 1000
+        self.b.perf_buffer_poll(timeout=timeout)
     
-    rto_ms = float(event.rto_us) / 1000
-    srtt_ms = float(event.srtt_us) / 1000 if event.srtt_us else 0
-    rttvar_ms = float(event.rttvar_us) / 1000 if event.rttvar_us else 0
-
-    # Format IP address if available
-    ip_str = "N/A"
-    port = 0
-    if event.addr_type == socket.AF_INET and event.ipv4_addr != 0:
-        ip_str = socket.inet_ntoa(struct.pack("I", event.ipv4_addr))
-        port = socket.ntohs(event.port)
+    def get_summary(self):
+        """Return summary statistics for collected data"""
+        results = []
+        for transport_id, events in sorted(self.rto_values.items()):
+            if not events:
+                continue
+            
+            # Calculate averages
+            rto_avg = sum(e['rto'] for e in events) / len(events)
+            srtt_avg = sum(e['srtt'] for e in events) / len(events)
+            rttvar_avg = sum(e['rttvar'] for e in events) / len(events)
+            
+            # Get transport info
+            info = self.transport_info.get(transport_id, {'ip': '', 'port': 0})
+            
+            results.append({
+                'transport_id': transport_id,
+                'ip': info['ip'],
+                'port': info['port'],
+                'samples': len(events),
+                'rto_avg': rto_avg,
+                'srtt_avg': srtt_avg,
+                'rttvar_avg': rttvar_avg
+            })
+        return results
     
-    if args.csv or args.file:
-        row = [
-            event.transport_id,
-            ip_str,
-            port,
-            f"{rto_ms:.3f}",
-            f"{srtt_ms:.3f}",
-            f"{rttvar_ms:.3f}",
-        ]
-        if args.file:
-            writer.writerow(row)
-        else:
-            print(",".join(map(str, row)))
-    else:
-        print(
-            f"Transport: {event.transport_id}, "
-            f"Addr: {ip_str}:{port}, "
-            f"RTO: {rto_ms:.3f} ms, SRTT: {srtt_ms:.3f} ms, RTTVAR: {rttvar_ms:.3f} ms"
-        )
+    def print_summary(self):
+        """Print or write summary data based on output mode"""
+        results = self.get_summary()
+        
+        if not results:
+            if not self.csv_output and not self.output_file:
+                print("No RTO events recorded yet.")
+            return
+            
+        for result in results:
+            if self.csv_output or self.output_file:
+                row = [
+                    result['transport_id'],
+                    result['ip'],
+                    result['port'],
+                    result['samples'],
+                    f"{result['rto_avg']:.2f}",
+                    f"{result['srtt_avg']:.2f}",
+                    f"{result['rttvar_avg']:.2f}"
+                ]
+                if self.output_file:
+                    self.writer.writerow(row)
+                elif self.csv_output:
+                    print(",".join(map(str, row)))
+            else:
+                # Plain text output
+                print(f"Transport {result['transport_id']} ({result['ip']}:{result['port']}):")
+                print(f"  Samples: {result['samples']}")
+                print(f"  RTO: {result['rto_avg']:.2f} ms avg")
+                print(f"  SRTT: {result['srtt_avg']:.2f} ms avg")
+                print(f"  RTTVAR: {result['rttvar_avg']:.2f} ms avg")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.csvfile:
+            self.csvfile.close()
 
+def parse_args():
+    # Parse command line arguments - keeping same args
+    parser = argparse.ArgumentParser(
+        description="Trace SCTP RTO updates and retransmissions")
+    parser.add_argument("-i", "--interval", type=int, default=1,
+        help="output interval, in seconds")
+    parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+    parser.add_argument(
+        "-f", "--file", metavar="FILE", help="Write output to a specified file"
+    )
+    return parser.parse_args()
 
-b["rto_events"].open_perf_buffer(process_rto_event)
-
-# Main loop
-if not args.csv and not args.file:
-    print("Tracing SCTP RTO... Ctrl+C to end")
-elif args.file:
-    # Write CSV header to file
-    print(f"Tracing SCTP RTO to file '{args.file}'... Ctrl+C to end")
-    writer.writerow(["transport_id", "ip_address", "port", "rto_ms", "srtt_ms", "rttvar_ms"])
-else:
-    # CSV to stdout, header already printed
-    print("Tracing SCTP RTO to stdout in CSV format... Ctrl+C to end")
-    print("transport_id,ip_address,port,rto_ms,srtt_ms,rttvar_ms")
-
-try:
-    while True:
-        b.perf_buffer_poll()
-        sleep(0.1)
-except KeyboardInterrupt:
+def signal_handler(signal, frame, tracer):
+    tracer.print_summary()
+    tracer.cleanup()
     print("\nTracing completed.")
-finally:
-    if csvfile:
-        csvfile.close()
+    exit()
+
+def main():
+    args = parse_args()
+    
+    tracer = SCTPRtoTracer(
+        interval=args.interval,
+        csv_output=args.csv,
+        output_file=args.file
+    )
+    tracer.setup()
+    
+    # Set up signal handler for clean exit
+    import signal
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, tracer))
+    
+    if not args.csv and not args.file:
+        print("Tracing SCTP RTO updates... Hit Ctrl-C to end")
+        print("%-12s %-15s %-6s %-10s %-10s %-10s %-12s" % 
+              ("TRANSPORT", "IP", "PORT", "RTO(ms)", "SRTT(ms)", "RTTVAR(ms)", "TIME"))
+    elif args.csv:
+        print("Tracing SCTP RTO updates to stdout in CSV format... Ctrl+C to end")
+        print("transport_id,ip_address,port,rto_ms,srtt_ms,rttvar_ms")
+    else:
+        print(f"Tracing SCTP RTO updates to file '{args.file}'... Ctrl+C to end")
+    
+    # Main loop
+    try:
+        while True:
+            tracer.poll_events()
+            sleep(args.interval)
+    except KeyboardInterrupt:
+        signal_handler(0, 0, tracer)
+
+if __name__ == "__main__":
+    main()

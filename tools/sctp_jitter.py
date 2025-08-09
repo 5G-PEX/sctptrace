@@ -15,19 +15,9 @@ import argparse
 import signal
 import collections
 import csv
+import os
 
-# Parse command line arguments
-parser = argparse.ArgumentParser(
-    description="Measure SCTP packet reception jitter")
-parser.add_argument("-i", "--interval", type=int, default=1,
-    help="output interval, in seconds")
-parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
-parser.add_argument(
-    "-f", "--file", metavar="FILE", help="Write output to a specified file"
-)
-args = parser.parse_args()
-
-# Define BPF program
+# Define BPF program - keeping original text exactly as is
 bpf_text = """
 #include <uapi/linux/ptrace.h>
 #include <net/sock.h>
@@ -50,7 +40,6 @@ struct stream_key_t {
 
 BPF_HASH(last_rx, struct stream_key_t, u64, 1024);
 BPF_PERF_OUTPUT(jitter_events);
-
 
 static struct sctp_datahdr *sctp_sm_pull_data(struct sctp_chunk *chunk) {
     // This function pulls the SACK header from the chunk.
@@ -91,7 +80,7 @@ int kprobe__sctp_eat_data(struct pt_regs *ctx, const struct sctp_association *as
     // Pull the Data header
     struct sctp_datahdr *data_hdr = sctp_sm_pull_data(chunk);
     if (!data_hdr) {
-        bpf_trace_printk("Failed to pull SACK header\\n");
+        bpf_trace_printk("NULL data_hdr pointer\\n");
         return 0;
     }
     
@@ -163,90 +152,169 @@ class JitterTracker:
         
         self.prev_delta = delta_ms
 
-# Track jitter per stream
-jitter_stats = {}  # (stream_id) -> JitterTracker
-
-print("Tracing SCTP packet reception jitter... Hit Ctrl-C to end")
-
-# Setup CSV file and writer if requested
-csvfile = None
-writer = None
-if args.file:
-    csvfile = open(args.file, "w", newline="")
-    writer = csv.writer(csvfile)
-
-# Process jitter events
-def process_jitter_event(cpu, data, size):
-    event = ct.cast(data, ct.POINTER(JitterEvent)).contents
-    delta_ms = float(event.delta_ns) / 1000  # ns to us
-    
-    # Track jitter
-    key = (event.stream_id)
-    if key not in jitter_stats:
-        jitter_stats[key] = JitterTracker()
-    
-    jitter_stats[key].update(delta_ms)
-    
-    timestamp = strftime("%H:%M:%S")
-
-    if not (args.csv or args.file):
-        print("%-8d %-12.3f %-12s" % 
-            (event.stream_id, delta_ms, timestamp))
-
-b["jitter_events"].open_perf_buffer(process_jitter_event)
-
-def print_summary():
-    for (stream_id), tracker in sorted(jitter_stats.items()):
-        if tracker.deltas:
-            delta_avg = sum(tracker.deltas) / len(tracker.deltas) if tracker.deltas else 0
-            delta_min = min(tracker.deltas) if tracker.deltas else 0
-            delta_max = max(tracker.deltas) if tracker.deltas else 0
+class SCTPJitterTracer:
+    def __init__(self, interval=1, csv_output=False, output_file=None):
+        self.interval = interval
+        self.csv_output = csv_output
+        self.output_file = output_file
+        self.b = None
+        self.csvfile = None
+        self.writer = None
+        self.jitter_stats = {}  # (stream_id) -> JitterTracker
+        self._setup_complete = False
+        
+    def setup(self):
+        if self._setup_complete:
+            return
             
-            if args.csv or args.file:
-                row = [
-                    stream_id,
-                    tracker.sample_count,
-                    f"{delta_avg:.3f}",
-                    f"{delta_min:.3f}",
-                    f"{delta_max:.3f}",
-                    f"{tracker.jitter:.3f}"
+        # Load BPF program
+        self.b = BPF(text=bpf_text)
+        
+        # Setup CSV file and writer if requested
+        if self.output_file:
+            output_dir = os.path.dirname(self.output_file)
+            if output_dir and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                
+            self.csvfile = open(self.output_file, "w", newline="")
+            self.writer = csv.writer(self.csvfile)
+            self.writer.writerow([
+                "stream_id", 
+                "sample_count", 
+                "delta_avg_us", 
+                "delta_min_us", 
+                "delta_max_us", 
+                "jitter_us"
+            ])
+        
+        # Set up perf buffer for events
+        self.b["jitter_events"].open_perf_buffer(self._process_jitter_event)
+        self._setup_complete = True
+        
+    def _process_jitter_event(self, cpu, data, size):
+        event = ct.cast(data, ct.POINTER(JitterEvent)).contents
+        delta_ms = float(event.delta_ns) / 1000  # ns to us
+        
+        # Track jitter
+        key = (event.stream_id)
+        if key not in self.jitter_stats:
+            self.jitter_stats[key] = JitterTracker()
+        
+        self.jitter_stats[key].update(delta_ms)
+        
+        timestamp = strftime("%H:%M:%S")
 
+        # if not (self.csv_output or self.output_file):
+        #     print("%-8d %-12.3f %-12s" % 
+        #         (event.stream_id, delta_ms, timestamp))
+    
+    def poll_events(self, timeout=None):
+        """Poll for events with optional timeout (in ms)"""
+        if not self._setup_complete:
+            self.setup()
+        if timeout is None:
+            timeout = self.interval * 1000
+        self.b.perf_buffer_poll(timeout=timeout)
+    
+    def get_summary(self):
+        """Return summary statistics for collected data"""
+        results = []
+        for stream_id, tracker in sorted(self.jitter_stats.items()):
+            if tracker.deltas:
+                delta_avg = sum(tracker.deltas) / len(tracker.deltas) if tracker.deltas else 0
+                delta_min = min(tracker.deltas) if tracker.deltas else 0
+                delta_max = max(tracker.deltas) if tracker.deltas else 0
+                
+                results.append({
+                    'stream_id': stream_id,
+                    'sample_count': tracker.sample_count,
+                    'delta_avg': delta_avg,
+                    'delta_min': delta_min,
+                    'delta_max': delta_max,
+                    'jitter': tracker.jitter
+                })
+        return results
+    
+    def print_summary(self):
+        """Print or write summary data based on output mode"""
+        results = self.get_summary()
+        
+        if not results:
+            return
+            
+        for result in results:
+            if self.csv_output or self.output_file:
+                row = [
+                    result['stream_id'],
+                    result['sample_count'],
+                    f"{result['delta_avg']:.3f}",
+                    f"{result['delta_min']:.3f}",
+                    f"{result['delta_max']:.3f}",
+                    f"{result['jitter']:.3f}"
                 ]
-                if args.file:
-                    writer.writerow(row)
-                else:
+                if self.output_file:
+                    self.writer.writerow(row)
+                elif self.csv_output:
                     print(",".join(map(str, row)))
             else:
-                print(f"Stream {stream_id}:")
-                print(f"  Samples: {tracker.sample_count}")
-                print(f"  Avg packet arrival delta: {delta_avg:.3f} us")
-                print(f"  Min/Max arrival delta: {delta_min:.3f}/{delta_max:.3f} us")
-                print(f"  Reception jitter (RFC 3550): {tracker.jitter:.3f} us")
+                # Plain text output
+                print(f"Stream {result['stream_id']}:")
+                print(f"  Samples: {result['sample_count']}")
+                print(f"  Packet Interval: {result['delta_avg']:.3f} us avg, {result['delta_min']:.3f}/{result['delta_max']:.3f} min/max")
+                print(f"  Jitter: {result['jitter']:.3f} us")
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.csvfile:
+            self.csvfile.close()
 
-# Cleanup on keyboard interrupt
-def signal_handler(signal, frame):
-    print_summary()
-    exit(0)
+def parse_args():
+    # Parse command line arguments - keeping same args
+    parser = argparse.ArgumentParser(
+        description="Measure SCTP packet reception jitter")
+    parser.add_argument("-i", "--interval", type=int, default=1,
+        help="output interval, in seconds")
+    parser.add_argument("-c", "--csv", action="store_true", help="Output in CSV format")
+    parser.add_argument(
+        "-f", "--file", metavar="FILE", help="Write output to a specified file"
+    )
+    return parser.parse_args()
 
-signal.signal(signal.SIGINT, signal_handler)
+def signal_handler(signal, frame, tracer):
+    tracer.print_summary()
+    tracer.cleanup()
+    print("\nTracing completed.")
+    exit()
 
-if not args.csv and not args.file:
-    print("%-8s %-12s %-12s" % ("STREAM", "DELTA(ms)", "TIME"))
-elif args.csv:
-    # CSV to stdout, header already printed
-    print("stream_id,samples,delta_avg_us,delta_min_us,delta_max_us,jitter_us")
-else:
-    # Write CSV header to file
-    print(f"Tracing SCTP RTT to file '{args.file}'... Ctrl+C to end")
-    writer.writerow(["stream_id", "samples", "delta_avg_us", "delta_min_us", "delta_max_us", "jitter_us"])
+def main():
+    args = parse_args()
+    
+    tracer = SCTPJitterTracer(
+        interval=args.interval,
+        csv_output=args.csv,
+        output_file=args.file
+    )
+    tracer.setup()
+    
+    # Set up signal handler for clean exit
+    signal.signal(signal.SIGINT, lambda sig, frame: signal_handler(sig, frame, tracer))
+    
+    print("Tracing SCTP packet reception jitter... Hit Ctrl-C to end")
 
-# Main loop
-while True:
+    if args.csv:
+        # CSV to stdout, header already printed
+        print("stream_id,samples,delta_avg_us,delta_min_us,delta_max_us,jitter_us")
+
+    # Main loop
     try:
-        b.perf_buffer_poll(timeout=args.interval * 1000)
+        while True:
+            tracer.poll_events()
+            sleep(args.interval)
+            # Only print summaries in standalone mode
+            if not args.csv and not args.file:
+                tracer.print_summary()
     except KeyboardInterrupt:
-        signal_handler(0, 0)
-        if csvfile:
-            csvfile.close()
-        print("\nTracing completed.")
-        exit()
+        signal_handler(0, 0, tracer)
+
+if __name__ == "__main__":
+    main()
