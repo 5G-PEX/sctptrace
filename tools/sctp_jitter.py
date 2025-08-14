@@ -63,7 +63,6 @@ static struct sctp_datahdr *sctp_sm_pull_data(struct sctp_chunk *chunk) {
 int kprobe__sctp_eat_data(struct pt_regs *ctx, const struct sctp_association *asoc,
                           struct sctp_chunk *chunk,
                           struct sctp_cmd_seq *commands) {
-    bpf_trace_printk("sctp_eat_data called\\n");
     struct jitter_event_t event = {};
     
     event.timestamp = bpf_ktime_get_ns();
@@ -72,8 +71,6 @@ int kprobe__sctp_eat_data(struct pt_regs *ctx, const struct sctp_association *as
     // Check for null chunk
     if (!chunk) 
         return 0;
-    
-    bpf_trace_printk("Chunk received: %p\\n", chunk);
 
     // Read stream ID directly from the chunk's data header
     // The stream ID is in the data_hdr substructure
@@ -89,26 +86,19 @@ int kprobe__sctp_eat_data(struct pt_regs *ctx, const struct sctp_association *as
         return 0;
     }
 
-    bpf_trace_printk("Data header: %p\\n", data_hdr);
-
     // Read stream ID from data header
     __be16 stream_id;
     bpf_probe_read(&stream_id, sizeof(stream_id), &data_hdr->stream);
     
     event.stream_id = ntohs(stream_id);
 
-    bpf_trace_printk("Stream ID: %d\\n", event.stream_id);
-    
     // Create key stream ID
     struct stream_key_t key = {};
     key.stream_id = event.stream_id;
-
-    bpf_trace_printk("Key created: Stream ID %d\\n", key.stream_id);
     
     // Get previous reception time for this stream
     u64 *prev_time = last_rx.lookup(&key);
     if (prev_time) {
-        bpf_trace_printk("Previous time found: %llu\\n", *prev_time);
         event.delta_ns = event.timestamp - *prev_time;
         jitter_events.perf_submit(ctx, &event, sizeof(event));
     } else {
