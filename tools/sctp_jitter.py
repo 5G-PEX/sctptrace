@@ -111,10 +111,6 @@ int kprobe__sctp_eat_data(struct pt_regs *ctx, const struct sctp_association *as
 }
 """
 
-# Load BPF program
-b = BPF(text=bpf_text)
-
-
 # Jitter event structure
 class JitterEvent(ct.Structure):
     _fields_ = [
